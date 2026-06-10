@@ -1,0 +1,502 @@
+---
+- name: CONFIGURE SLURM MASTER
+  hosts: slurm_master
+  become: yes
+  vars:
+    cluster_iface: "enp0s9"
+    cluster_ip: "192.168.122.100"
+    cluster_subnet: "192.168.122.0/24" # NFS
+    dhcp_range_start: "192.168.122.200"
+    dhcp_range_end: "192.168.122.250"
+    compute_node_ip: "192.168.122.221"
+
+    master_hostname: "login-node"
+    compute_hostname: "compute-01"
+    compute_cpus: "1"
+    compute_memory: "1900"
+    slurm_cluster_name: "gpu_cluster"
+    slurm_partition_name: "gpu"
+
+    compute_root_pass: ""
+    ipa_admin_pass: ""
+    slurm_db_pass: ""
+
+    munge_uid: 2001
+    slurm_uid: 2002
+    rootfs_dir: "/export/home/rootfs"
+
+    ipa_domain: "hpc.local"
+    ipa_realm: "HPC.LOCAL"
+
+  tasks:
+    - name: SYSTEM | Set correct FQDN hostname for Slurm Master
+      hostname:
+        name: "{{ master_hostname }}.{{ ipa_domain }}"
+
+    - name: SYSTEM | Add FQDN and short hostname to /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        regexp: "^{{ cluster_ip }}"
+        line: "{{ cluster_ip }} {{ master_hostname }}.{{ ipa_domain }} {{ master_hostname }}"
+        state: present
+
+    - name: SYSTEM | Disable and stop Firewalld
+      service:
+        name: firewalld
+        state: stopped
+        enabled: no
+      ignore_errors: yes
+
+    - name: SYSTEM | Disable SELinux
+      lineinfile:
+        path: /etc/selinux/config
+        regexp: '^SELINUX='
+        line: 'SELINUX=permissive'
+
+    - name: SYSTEM | Apply permissive SELinux immediately
+      command: setenforce 0
+      ignore_errors: yes
+      changed_when: false
+
+    - name: NETWORK | Set Static IP for Cluster Internal Network
+      nmcli:
+        conn_name: "{{ cluster_iface }}"
+        ifname: "{{ cluster_iface }}"
+        type: ethernet
+        ip4: "{{ cluster_ip }}/24"
+        state: present
+      ignore_errors: yes
+
+    - name: SYSTEM | Create User Groups (Munge & Slurm)
+      group:
+        name: "{{ item.name }}"
+        gid: "{{ item.gid }}"
+        state: present
+      loop:
+        - { name: 'munge', gid: "{{ munge_uid }}" }
+        - { name: 'slurm', gid: "{{ slurm_uid }}" }
+
+    - name: SYSTEM | Create Users (Munge & Slurm)
+      user:
+        name: "{{ item.name }}"
+        uid: "{{ item.uid }}"
+        group: "{{ item.name }}"
+        system: yes
+      loop:
+        - { name: 'munge', uid: "{{ munge_uid }}" }
+        - { name: 'slurm', uid: "{{ slurm_uid }}" }
+
+    - name: SYSTEM | Add compute node to Master's /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        regexp: "^{{ compute_node_ip }}"
+        line: "{{ compute_node_ip }} {{ compute_hostname }}"
+        state: present
+
+    - name: PACKAGES | Install EPEL Repository & Enable CRB
+      dnf:
+        name: epel-release
+        state: present
+    - command: dnf config-manager --set-enabled crb
+      register: crb_result
+      changed_when: "'enabled' in crb_result.stdout"
+
+    - name: PACKAGES | Install Master Services
+      dnf:
+        name:
+          - slurm-slurmctld
+          - slurm-slurmdbd
+          - mariadb-server
+          - munge
+          - nfs-utils
+          - dnsmasq
+          - syslinux
+          - syslinux-nonlinux
+          - ipa-server
+          - ipa-server-dns
+          - bind-dyndb-ldap
+        state: present
+
+    - name: NFS | Create shared directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /shared
+        - /export/home
+
+    - name: NFS | Configure /etc/exports
+      copy:
+        dest: /etc/exports
+        content: |
+          {{ rootfs_dir }} *(rw,sync,no_root_squash,no_all_squash)
+          /shared *(rw,sync,no_root_squash,no_all_squash)
+      notify: Restart NFS Server
+
+    - name: NFS | Start and Enable NFS Server
+      service: name=nfs-server state=started enabled=yes
+
+    - name: MUNGE | Ensure strict permissions on Munge config and logs
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: munge
+        group: munge
+        mode: '0700'
+      loop:
+        - /etc/munge
+        - /var/log/munge
+      ignore_errors: yes
+
+    - name: MUNGE | Ensure accessible permissions on Munge run directory
+      file:
+        path: /run/munge
+        state: directory
+        owner: munge
+        group: munge
+        mode: '0755'
+
+    - name: MUNGE | Generate Key
+      command: /usr/sbin/create-munge-key
+      args:
+        creates: /etc/munge/munge.key
+
+    - name: MUNGE | Ensure Munge Key permissions
+      file:
+        path: /etc/munge/munge.key
+        owner: munge
+        group: munge
+        mode: '0400'
+
+    - name: MUNGE | Enable and start Munge daemon
+      service: name=munge state=restarted enabled=yes
+
+    - name: DATABASE | Init MariaDB for Slurm
+      block:
+        - service: name=mariadb state=started enabled=yes
+        - shell: |
+            mysql -u root -e "CREATE DATABASE IF NOT EXISTS slurm_acct_db;"
+            mysql -u root -e "GRANT ALL ON slurm_acct_db.* TO 'slurm'@'localhost' IDENTIFIED BY '{{ slurm_db_pass }}' WITH GRANT OPTION;"
+            mysql -u root -e "FLUSH PRIVILEGES;"
+      ignore_errors: yes
+
+    - name: SLURM | Configure slurm.conf
+      copy:
+        dest: /etc/slurm/slurm.conf
+        content: |
+          ClusterName={{ slurm_cluster_name }}
+          SlurmctldHost={{ master_hostname }}({{ cluster_ip }})
+          AuthType=auth/munge
+          ProctrackType=proctrack/cgroup
+          ReturnToService=2
+          SlurmUser=slurm
+          StateSaveLocation=/var/spool/slurmctld
+          SlurmctldLogFile=/var/log/slurm/slurmctld.log
+          SlurmdLogFile=/var/log/slurm/slurmd.log
+          AccountingStorageType=accounting_storage/slurmdbd
+          NodeName=DEFAULT CPUs={{ compute_cpus }} RealMemory={{ compute_memory }} State=UNKNOWN
+          NodeName={{ compute_hostname }}
+          PartitionName={{ slurm_partition_name }} Nodes={{ compute_hostname }} Default=YES MaxTime=INFINITE State=UP
+        owner: slurm
+        mode: '0644'
+      notify: Restart Slurm Services
+
+    - name: SLURM | Configure slurmdbd.conf
+      copy:
+        dest: /etc/slurm/slurmdbd.conf
+        content: |
+          AuthType=auth/munge
+          DbdAddr={{ cluster_ip }}
+          DbdHost=login-node
+          SlurmUser=slurm
+          StorageType=accounting_storage/mysql
+          StorageUser=slurm
+          StoragePass={{ slurm_db_pass }}
+          StorageLoc=slurm_acct_db
+        owner: slurm
+        mode: '0600'
+      notify: Restart Slurm Services
+
+    - name: NFS | Export /home directory for compute nodes
+      lineinfile:
+        path: /etc/exports
+        line: "/home {{ cluster_subnet }}(rw,sync,no_root_squash,no_subtree_check)"
+        state: present
+
+    - name: NFS | Apply new exports immediately
+      command: exportfs -ra
+      changed_when: false
+
+    - name: FREEIPA | Install FreeIPA Server packages on Master
+      dnf:
+        name: 
+          - ipa-server
+        state: present
+
+    - name: FREEIPA | Configure FreeIPA Server
+      command: >
+        ipa-server-install --unattended 
+        --realm HPC.LOCAL 
+        --domain hpc.local 
+        --ds-password=RootPassword123! 
+        --admin-password=RootPassword123! 
+        --hostname=login-node.hpc.local 
+        --mkhomedir 
+        --no-ntp
+      args:
+        creates: /etc/ipa/default.conf
+
+    - name: PXE | Create TFTP directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /var/lib/tftpboot
+        - /var/lib/tftpboot/pxelinux.cfg
+
+    - name: PXE | Configure dnsmasq
+      copy:
+        dest: /etc/dnsmasq.conf
+        content: |
+          port=0 
+          interface={{ cluster_iface }}
+          dhcp-range={{ dhcp_range_start }},{{ dhcp_range_end }},12h
+          enable-tftp
+          tftp-root=/var/lib/tftpboot
+          dhcp-boot=pxelinux.0
+      notify: Restart dnsmasq
+
+    - name: PXE | Copy syslinux bootloaders and libraries to TFTP
+      shell: cp /usr/share/syslinux/pxelinux.0 /usr/share/syslinux/*.c32 /var/lib/tftpboot/
+
+    - name: PXE | Ensure TFTP files have correct permissions
+      file:
+        path: /var/lib/tftpboot
+        state: directory
+        recurse: yes
+        mode: '0755'
+
+    - name: PXE | Create Default PXE Boot Menu
+      copy:
+        dest: /var/lib/tftpboot/pxelinux.cfg/default
+        content: |
+          default menu.c32
+          prompt 0
+          timeout 50
+          menu title Slurm HPC - PXE Boot Menu
+          
+          label compute-node
+            menu label Boot Stateless Compute Node
+            kernel vmlinuz
+            append initrd=initramfs.img root=nfs:{{ cluster_ip }}:{{ rootfs_dir }},nfsvers=3 rw ip=dhcp selinux=0 systemd.hostname={{ compute_hostname }}
+            
+          label local
+            menu label Boot from local hard drive
+            localboot 0
+
+    - name: PXE | Start dnsmasq
+      service: name=dnsmasq state=started enabled=yes
+
+    - name: ROOTFS | Build Compute Node Filesystem
+      block:
+        - file: path="{{ rootfs_dir }}/{{ item }}" state=directory
+          loop: ["", "proc", "sys", "dev"]
+        - shell: |
+            mountpoint -q {{ rootfs_dir }}/proc || mount -t proc /proc {{ rootfs_dir }}/proc
+            mountpoint -q {{ rootfs_dir }}/sys || mount -t sysfs /sys {{ rootfs_dir }}/sys
+            mountpoint -q {{ rootfs_dir }}/dev || mount --bind /dev {{ rootfs_dir }}/dev
+          changed_when: false
+        - command: >
+            dnf --installroot={{ rootfs_dir }} --releasever=9 --setopt=install_weak_deps=False -y
+            install basesystem kernel nfs-utils bash coreutils iproute dhcp-client epel-release slurm-slurmd munge openssh-server dracut-network kernel-core hostname freeipa-client oddjob-mkhomedir
+          args:
+            creates: "{{ rootfs_dir }}/usr/sbin/slurmd"
+        
+        - name: ROOTFS | Synchronize UIDs and GIDs for Munge and Slurm
+          shell: |
+            chroot {{ rootfs_dir }} getent group munge || chroot {{ rootfs_dir }} groupadd -g {{ munge_uid }} munge
+            chroot {{ rootfs_dir }} groupmod -g {{ munge_uid }} munge
+            chroot {{ rootfs_dir }} getent passwd munge || chroot {{ rootfs_dir }} useradd -u {{ munge_uid }} -g {{ munge_uid }} -s /sbin/nologin munge
+            chroot {{ rootfs_dir }} usermod -u {{ munge_uid }} -g {{ munge_uid }} munge
+            
+            chroot {{ rootfs_dir }} getent group slurm || chroot {{ rootfs_dir }} groupadd -g {{ slurm_uid }} slurm
+            chroot {{ rootfs_dir }} groupmod -g {{ slurm_uid }} slurm
+            chroot {{ rootfs_dir }} getent passwd slurm || chroot {{ rootfs_dir }} useradd -u {{ slurm_uid }} -g {{ slurm_uid }} -s /sbin/nologin slurm
+            chroot {{ rootfs_dir }} usermod -u {{ slurm_uid }} -g {{ slurm_uid }} slurm
+            
+            chroot {{ rootfs_dir }} chown -R munge:munge /etc/munge /var/log/munge /run/munge /var/lib/munge 2>/dev/null || true
+            chroot {{ rootfs_dir }} chown -R slurm:slurm /var/spool/slurmd /var/log/slurm /etc/slurm 2>/dev/null || true
+
+        - name: ROOTFS | Set root password for compute node
+          lineinfile:
+            path: "{{ rootfs_dir }}/etc/shadow"
+            regexp: '^root:'
+            line: "root:{{ compute_root_pass | password_hash('sha512') }}:19000:0:99999:7:::"
+
+        - name: ROOTFS | Extract kernel and build initramfs manually
+          shell: |
+            set -e
+            KVER=$(ls -1 {{ rootfs_dir }}/lib/modules | grep -v rescue | head -n 1)
+            
+            if [ -z "$KVER" ]; then
+              echo "Error: no kernel in /lib/modules"
+              exit 1
+            fi
+            
+            cp "{{ rootfs_dir }}/lib/modules/$KVER/vmlinuz" "{{ rootfs_dir }}/boot/vmlinuz-$KVER"
+            
+            chroot {{ rootfs_dir }} dracut --force --add "network nfs" /boot/initramfs-$KVER.img $KVER
+            
+            cp "{{ rootfs_dir }}/boot/vmlinuz-$KVER" /var/lib/tftpboot/vmlinuz
+            cp "{{ rootfs_dir }}/boot/initramfs-$KVER.img" /var/lib/tftpboot/initramfs.img
+            chmod 644 /var/lib/tftpboot/vmlinuz /var/lib/tftpboot/initramfs.img
+
+        - name: ROOTFS | Mount Master's /home on compute node
+          lineinfile:
+            path: "{{ rootfs_dir }}/etc/fstab"
+            line: "{{ cluster_ip }}:/home /home nfs defaults 0 0"
+            state: present
+      always:
+        - shell: |
+            mountpoint -q {{ rootfs_dir }}/dev && umount {{ rootfs_dir }}/dev || true
+            mountpoint -q {{ rootfs_dir }}/sys && umount {{ rootfs_dir }}/sys || true
+            mountpoint -q {{ rootfs_dir }}/proc && umount {{ rootfs_dir }}/proc || true
+          changed_when: false
+
+    - name: ROOTFS | Configure fstab for diskless node
+      copy:
+        dest: "{{ rootfs_dir }}/etc/fstab"
+        content: |
+          {{ cluster_ip }}:{{ rootfs_dir }} / nfs defaults,nfsvers=3,rw 0 0
+          none /tmp tmpfs defaults 0 0
+          none /var/tmp tmpfs defaults 0 0
+          none /dev/shm tmpfs defaults 0 0
+          sysfs /sys sysfs defaults 0 0
+          proc /proc proc defaults 0 0
+
+    - name: ROOTFS | Configure Slurm and Munge on Compute Node
+      block:
+        - name: ROOTFS | Copy munge.key to compute node
+          copy:
+            src: /etc/munge/munge.key
+            dest: "{{ rootfs_dir }}/etc/munge/munge.key"
+            remote_src: yes
+            owner: munge
+            group: munge
+            mode: '0400'
+
+        - name: ROOTFS | Copy slurm.conf to compute node
+          copy:
+            src: /etc/slurm/slurm.conf
+            dest: "{{ rootfs_dir }}/etc/slurm/slurm.conf"
+            remote_src: yes
+            owner: slurm
+            group: slurm
+            mode: '0644'
+
+        - name: ROOTFS | Create log and spool directories for slurmd
+          file:
+            path: "{{ rootfs_dir }}{{ item }}"
+            state: directory
+            owner: slurm
+            group: slurm
+            mode: '0755'
+          loop:
+            - /var/spool/slurmd
+            - /var/log/slurm
+
+        - name: ROOTFS | Enable Munge and Slurmd services to start on boot
+          command: chroot {{ rootfs_dir }} systemctl enable munge slurmd
+          changed_when: false
+
+        - name: ROOTFS | Add Master IP to compute node's /etc/hosts
+          lineinfile:
+            path: "{{ rootfs_dir }}/etc/hosts"
+            regexp: "^{{ cluster_ip }}"
+            line: "{{ cluster_ip }} {{ master_hostname }}"
+            state: present
+
+        - name: ROOTFS | Ensure FreeIPA client is installed in image
+          dnf:
+            name:
+              - freeipa-client
+              - oddjob-mkhomedir
+            state: present
+            installroot: "{{ rootfs_dir }}"
+
+        - name: ROOTFS | Create IPA auto-join script for stateless nodes
+          copy:
+            dest: "{{ rootfs_dir }}/usr/local/bin/join-ipa.sh"
+            mode: '0700'
+            content: |
+              #!/bin/bash
+              if [ -f /etc/ipa/default.conf ]; then
+                exit 0
+              fi
+              
+              sleep 10
+
+              ipa-client-install --unattended \
+                --domain {{ ipa_domain }} \
+                --server {{ master_hostname }}.{{ ipa_domain }} \
+                --realm {{ ipa_realm }} \
+                --principal admin \
+                --password {{ ipa_admin_pass }} \
+                --mkhomedir \
+                --force-join
+
+              systemctl restart slurmd
+
+        - name: ROOTFS | Create systemd service for IPA auto-join
+          copy:
+            dest: "{{ rootfs_dir }}/etc/systemd/system/ipa-join.service"
+            content: |
+              [Unit]
+              Description=Join FreeIPA Domain on Boot
+              After=network-online.target slurmctld.service
+              Wants=network-online.target
+
+              [Service]
+              Type=oneshot
+              ExecStart=/usr/local/bin/join-ipa.sh
+              RemainAfterExit=yes
+
+              [Install]
+              WantedBy=multi-user.target
+
+        - name: ROOTFS | Enable IPA auto-join service
+          command: chroot {{ rootfs_dir }} systemctl enable ipa-join.service
+          changed_when: false
+
+        - name: ROOTFS | Mount Master's /home on compute node
+          lineinfile:
+            path: "{{ rootfs_dir }}/etc/fstab"
+            line: "{{ cluster_ip }}:/home /home nfs defaults 0 0"
+            state: present
+
+    - name: SLURM | Enable and start Slurm Services
+      service:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+      loop:
+        - slurmdbd
+        - slurmctld
+
+  handlers:
+    - name: Restart NFS Server
+      command: exportfs -ra
+    - name: Restart Munge
+      service: name=munge state=restarted enabled=yes
+    - name: Restart Slurm Services
+      service:
+        name: "{{ item }}"
+        state: restarted
+        enabled: yes
+      loop:
+        - slurmdbd
+        - slurmctld
+    - name: Restart dnsmasq
+      service: name=dnsmasq state=restarted
