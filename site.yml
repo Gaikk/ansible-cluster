@@ -59,7 +59,7 @@
       changed_when: false
 
     - name: NETWORK | Set Static IP for Cluster Internal Network
-      nmcli:
+      community.general.nmcli:
         conn_name: "{{ cluster_iface }}"
         ifname: "{{ cluster_iface }}"
         type: ethernet
@@ -125,6 +125,7 @@
       loop:
         - /shared
         - /export/home
+        - "{{ rootfs_dir }}"
 
     - name: NFS | Configure /etc/exports
       copy:
@@ -180,6 +181,14 @@
             mysql -u root -e "GRANT ALL ON slurm_acct_db.* TO 'slurm'@'localhost' IDENTIFIED BY '{{ slurm_db_pass }}' WITH GRANT OPTION;"
             mysql -u root -e "FLUSH PRIVILEGES;"
       ignore_errors: yes
+
+    - name: SLURM | Create StateSaveLocation directory for slurmctld
+      file:
+        path: /var/spool/slurmctld
+        state: directory
+        owner: slurm
+        group: slurm
+        mode: '0755'
 
     - name: SLURM | Configure slurm.conf
       copy:
@@ -353,11 +362,6 @@
             cp "{{ rootfs_dir }}/boot/initramfs-$KVER.img" /var/lib/tftpboot/initramfs.img
             chmod 644 /var/lib/tftpboot/vmlinuz /var/lib/tftpboot/initramfs.img
 
-        - name: ROOTFS | Mount Master's /home on compute node
-          lineinfile:
-            path: "{{ rootfs_dir }}/etc/fstab"
-            line: "{{ cluster_ip }}:/home /home nfs defaults 0 0"
-            state: present
       always:
         - shell: |
             mountpoint -q {{ rootfs_dir }}/dev && umount {{ rootfs_dir }}/dev || true
