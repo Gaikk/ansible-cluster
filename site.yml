@@ -23,7 +23,7 @@
 
     munge_uid: 2001
     slurm_uid: 2002
-    rootfs_dir: "/export/home/rootfs"
+    rootfs_dir: "/export/rootfs"
 
     ipa_domain: "hpc.local"
     ipa_realm: "HPC.LOCAL"
@@ -90,13 +90,14 @@
       lineinfile:
         path: /etc/hosts
         regexp: "^{{ compute_node_ip }}"
-        line: "{{ compute_node_ip }} {{ compute_hostname }}"
+        line: "{{ compute_node_ip }} {{ compute_hostname }}.{{ ipa_domain }} {{ compute_hostname }}"
         state: present
 
     - name: PACKAGES | Install EPEL Repository & Enable CRB
       dnf:
         name: epel-release
         state: present
+
     - command: dnf config-manager --set-enabled crb
       register: crb_result
       changed_when: "'enabled' in crb_result.stdout"
@@ -117,26 +118,40 @@
           - bind-dyndb-ldap
         state: present
 
-    - name: NFS | Create shared directories
+    - name: NFS | Create storage and rootfs directories
       file:
-        path: "{{ item }}"
+        path: "{{ item.path }}"
         state: directory
-        mode: '0755'
+        mode: "{{ item.mode }}"
       loop:
-        - /shared
-        - /export/home
-        - "{{ rootfs_dir }}"
+        - { path: '/scratch', mode: '1777' }
+        - { path: '{{ rootfs_dir }}', mode: '0755' }
 
     - name: NFS | Configure /etc/exports
       copy:
         dest: /etc/exports
         content: |
-          {{ rootfs_dir }} *(rw,sync,no_root_squash,no_all_squash)
-          /shared *(rw,sync,no_root_squash,no_all_squash)
+          {{ rootfs_dir }} {{ cluster_subnet }}(rw,sync,no_root_squash,no_all_squash,no_subtree_check)
+          /home {{ cluster_subnet }}(rw,sync,root_squash,no_subtree_check)
+          /scratch {{ cluster_subnet }}(rw,sync,root_squash,no_subtree_check)
       notify: Restart NFS Server
 
     - name: NFS | Start and Enable NFS Server
       service: name=nfs-server state=started enabled=yes
+
+    - name: NFS | Apply new exports immediately
+      command: exportfs -ra
+      changed_when: false
+
+    - name: STORAGE | Configure automatic $SCRATCH profile on Master
+      copy:
+        dest: /etc/profile.d/scratch.sh
+        mode: '0644'
+        content: |
+          if [ "$EUID" -ge 1000 ] && [ "$USER" != "nobody" ] && [ -d /scratch ]; then
+            export SCRATCH="/scratch/$USER"
+            [ ! -d "$SCRATCH" ] && mkdir -p -m 0700 "$SCRATCH" 2>/dev/null
+          fi
 
     - name: MUNGE | Ensure strict permissions on Munge config and logs
       file:
@@ -203,10 +218,40 @@
           StateSaveLocation=/var/spool/slurmctld
           SlurmctldLogFile=/var/log/slurm/slurmctld.log
           SlurmdLogFile=/var/log/slurm/slurmd.log
+          SrunPortRange=60001-63000
+          SlurmdParameters=config_overrides
+          TaskProlog=/etc/slurm/task_prolog.sh
           AccountingStorageType=accounting_storage/slurmdbd
           NodeName=DEFAULT CPUs={{ compute_cpus }} RealMemory={{ compute_memory }} State=UNKNOWN
-          NodeName={{ compute_hostname }}
+          NodeName={{ compute_hostname }} NodeAddr={{ compute_node_ip }}
           PartitionName={{ slurm_partition_name }} Nodes={{ compute_hostname }} Default=YES MaxTime=INFINITE State=UP
+        owner: slurm
+        mode: '0644'
+      notify: Restart Slurm Services
+
+    - name: SLURM | Configure TaskProlog for per-user /scratch isolation
+      copy:
+        dest: /etc/slurm/task_prolog.sh
+        owner: root
+        group: root
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          if [ -n "$SLURM_JOB_USER" ] && [ "$SLURM_JOB_USER" != "root" ]; then
+            USER_SCRATCH="/scratch/${SLURM_JOB_USER}"
+            if [ ! -d "$USER_SCRATCH" ]; then
+              mkdir -p -m 0700 "$USER_SCRATCH"
+            fi
+            echo "export SCRATCH=${USER_SCRATCH}"
+          fi
+
+    - name: SLURM | Configure cgroup.conf
+      copy:
+        dest: /etc/slurm/cgroup.conf
+        content: |
+          CgroupPlugin=autodetect
+          ConstrainCores=yes
+          ConstrainRAMSpace=yes
         owner: slurm
         mode: '0644'
       notify: Restart Slurm Services
@@ -227,16 +272,6 @@
         mode: '0600'
       notify: Restart Slurm Services
 
-    - name: NFS | Export /home directory for compute nodes
-      lineinfile:
-        path: /etc/exports
-        line: "/home {{ cluster_subnet }}(rw,sync,no_root_squash,no_subtree_check)"
-        state: present
-
-    - name: NFS | Apply new exports immediately
-      command: exportfs -ra
-      changed_when: false
-
     - name: FREEIPA | Install FreeIPA Server packages on Master
       dnf:
         name: 
@@ -246,11 +281,11 @@
     - name: FREEIPA | Configure FreeIPA Server
       command: >
         ipa-server-install --unattended 
-        --realm HPC.LOCAL 
-        --domain hpc.local 
-        --ds-password=RootPassword123! 
-        --admin-password=RootPassword123! 
-        --hostname=login-node.hpc.local 
+        --realm {{ ipa_realm }} 
+        --domain {{ ipa_domain }} 
+        --ds-password={{ ipa_admin_pass }} 
+        --admin-password={{ ipa_admin_pass }} 
+        --hostname={{ master_hostname }}.{{ ipa_domain }} 
         --mkhomedir 
         --no-ntp
       args:
@@ -271,7 +306,10 @@
         content: |
           port=0 
           interface={{ cluster_iface }}
+          bind-interfaces
           dhcp-range={{ dhcp_range_start }},{{ dhcp_range_end }},12h
+          dhcp-host={{ compute_hostname }},{{ compute_node_ip }}
+          dhcp-option=option:dns-server,{{ cluster_ip }}
           enable-tftp
           tftp-root=/var/lib/tftpboot
           dhcp-boot=pxelinux.0
@@ -299,7 +337,7 @@
           label compute-node
             menu label Boot Stateless Compute Node
             kernel vmlinuz
-            append initrd=initramfs.img root=nfs:{{ cluster_ip }}:{{ rootfs_dir }},nfsvers=3 rw ip=dhcp selinux=0 systemd.hostname={{ compute_hostname }}
+            append initrd=initramfs.img root=nfs:{{ cluster_ip }}:{{ rootfs_dir }},nfsvers=3 rw ip=::::{{ compute_hostname }}::dhcp selinux=0 systemd.hostname={{ compute_hostname }}
             
           label local
             menu label Boot from local hard drive
@@ -369,11 +407,22 @@
             mountpoint -q {{ rootfs_dir }}/proc && umount {{ rootfs_dir }}/proc || true
           changed_when: false
 
+    - name: ROOTFS | Create storage mountpoints in compute rootfs
+      file:
+        path: "{{ rootfs_dir }}{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /home
+        - /scratch
+
     - name: ROOTFS | Configure fstab for diskless node
       copy:
         dest: "{{ rootfs_dir }}/etc/fstab"
         content: |
           {{ cluster_ip }}:{{ rootfs_dir }} / nfs defaults,nfsvers=3,rw 0 0
+          {{ cluster_ip }}:/home /home nfs defaults,nfsvers=3 0 0
+          {{ cluster_ip }}:/scratch /scratch nfs defaults,nfsvers=3 0 0
           none /tmp tmpfs defaults 0 0
           none /var/tmp tmpfs defaults 0 0
           none /dev/shm tmpfs defaults 0 0
@@ -391,14 +440,18 @@
             group: munge
             mode: '0400'
 
-        - name: ROOTFS | Copy slurm.conf to compute node
+        - name: ROOTFS | Copy Slurm configs and TaskProlog to compute node
           copy:
-            src: /etc/slurm/slurm.conf
-            dest: "{{ rootfs_dir }}/etc/slurm/slurm.conf"
+            src: "/etc/slurm/{{ item.file }}"
+            dest: "{{ rootfs_dir }}/etc/slurm/{{ item.file }}"
             remote_src: yes
-            owner: slurm
-            group: slurm
-            mode: '0644'
+            owner: "{{ item.owner }}"
+            group: "{{ item.owner }}"
+            mode: "{{ item.mode }}"
+          loop:
+            - { file: 'slurm.conf', owner: 'slurm', mode: '0644' }
+            - { file: 'cgroup.conf', owner: 'slurm', mode: '0644' }
+            - { file: 'task_prolog.sh', owner: 'root', mode: '0755' }
 
         - name: ROOTFS | Create log and spool directories for slurmd
           file:
@@ -415,12 +468,15 @@
           command: chroot {{ rootfs_dir }} systemctl enable munge slurmd
           changed_when: false
 
-        - name: ROOTFS | Add Master IP to compute node's /etc/hosts
+        - name: ROOTFS | Add Master and Compute IPs to compute node's /etc/hosts
           lineinfile:
             path: "{{ rootfs_dir }}/etc/hosts"
-            regexp: "^{{ cluster_ip }}"
-            line: "{{ cluster_ip }} {{ master_hostname }}"
+            regexp: "^{{ item.ip }}"
+            line: "{{ item.ip }} {{ item.fqdn }} {{ item.short }}"
             state: present
+          loop:
+            - { ip: "{{ cluster_ip }}", fqdn: "{{ master_hostname }}.{{ ipa_domain }}", short: "{{ master_hostname }}" }
+            - { ip: "{{ compute_node_ip }}", fqdn: "{{ compute_hostname }}.{{ ipa_domain }}", short: "{{ compute_hostname }}" }
 
         - name: ROOTFS | Ensure FreeIPA client is installed in image
           dnf:
@@ -451,16 +507,15 @@
                 --mkhomedir \
                 --force-join
 
-              systemctl restart slurmd
-
         - name: ROOTFS | Create systemd service for IPA auto-join
           copy:
             dest: "{{ rootfs_dir }}/etc/systemd/system/ipa-join.service"
             content: |
               [Unit]
               Description=Join FreeIPA Domain on Boot
-              After=network-online.target slurmctld.service
+              After=network-online.target munge.service
               Wants=network-online.target
+              Before=slurmd.service
 
               [Service]
               Type=oneshot
@@ -469,16 +524,20 @@
 
               [Install]
               WantedBy=multi-user.target
+              RequiredBy=slurmd.service
 
         - name: ROOTFS | Enable IPA auto-join service
           command: chroot {{ rootfs_dir }} systemctl enable ipa-join.service
           changed_when: false
 
-        - name: ROOTFS | Mount Master's /home on compute node
-          lineinfile:
-            path: "{{ rootfs_dir }}/etc/fstab"
-            line: "{{ cluster_ip }}:/home /home nfs defaults 0 0"
-            state: present
+        - name: ROOTFS | Copy scratch profile script to compute node
+          copy:
+            src: /etc/profile.d/scratch.sh
+            dest: "{{ rootfs_dir }}/etc/profile.d/scratch.sh"
+            remote_src: yes
+            owner: root
+            group: root
+            mode: '0644'
 
     - name: SLURM | Enable and start Slurm Services
       service:
