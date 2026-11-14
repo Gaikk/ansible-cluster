@@ -6,9 +6,8 @@
     cluster_iface: "enp0s8"
     cluster_ip: ""
     cluster_subnet: "/24" # NFS
-    dhcp_range_start: ""
-    dhcp_range_end: ""
     compute_node_ip: ""
+    compute_node_mac: ""
 
     master_hostname: "login-node"
     compute_hostname: "compute-01"
@@ -308,11 +307,11 @@
       copy:
         dest: /etc/dnsmasq.conf
         content: |
-          port=0 
+          port=0
           interface={{ cluster_iface }}
           bind-interfaces
-          dhcp-range={{ dhcp_range_start }},{{ dhcp_range_end }},12h
-          dhcp-host={{ compute_hostname }},{{ compute_node_ip }}
+          dhcp-range={{ compute_node_ip }},static,255.255.255.0,12h
+          dhcp-host={{ compute_node_mac }},{{ compute_hostname }},{{ compute_node_ip }}
           dhcp-option=option:dns-server,{{ cluster_ip }}
           enable-tftp
           tftp-root=/var/lib/tftpboot
