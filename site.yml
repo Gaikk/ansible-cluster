@@ -3,12 +3,12 @@
   hosts: slurm_master
   become: yes
   vars:
-    cluster_iface: "enp0s9"
-    cluster_ip: "192.168.122.100"
-    cluster_subnet: "192.168.122.0/24" # NFS
-    dhcp_range_start: "192.168.122.200"
-    dhcp_range_end: "192.168.122.250"
-    compute_node_ip: "192.168.122.221"
+    cluster_iface: "enp0s8"
+    cluster_ip: ""
+    cluster_subnet: "/24" # NFS
+    dhcp_range_start: ""
+    dhcp_range_end: ""
+    compute_node_ip: ""
 
     master_hostname: "login-node"
     compute_hostname: "compute-01"
@@ -64,8 +64,12 @@
         ifname: "{{ cluster_iface }}"
         type: ethernet
         ip4: "{{ cluster_ip }}/24"
+        autoconnect: yes
         state: present
-      ignore_errors: yes
+
+    - name: NETWORK | Activate Cluster Internal Network interface
+      command: "nmcli connection up {{ cluster_iface }}"
+      changed_when: false
 
     - name: SYSTEM | Create User Groups (Munge & Slurm)
       group:
